@@ -8,7 +8,6 @@ let GoogleGenAI, LiveKitRtc, LiveKitAudioFrame;
 const app = express();
 app.use(cors());
 app.use(express.json());
-// Headers SSE explicites pour éviter les blocages navigateur/CDN
 app.options('/events', cors());
 
 const PORT = process.env.PORT || 3000;
@@ -38,7 +37,7 @@ function broadcastSSE(msg) {
   const data = `data: ${JSON.stringify({t: Date.now(), m: clean})}\n\n`;
   for (const res of sseClients) { try { res.write(data); } catch(e){} }
 }
-log('=== Démarrage serveur traduction Studio Zaloria ===');
+log('=== Démarrage serveur traduction Studio Zaloria v1.0.5 ===');
 process.on('uncaughtException', (err) => log(`💥 Erreur non capturée: ${err?.stack || err}`));
 process.on('unhandledRejection', (reason) => log(`💥 Promesse rejetée: ${reason?.stack || reason}`));
 let ai;
@@ -78,10 +77,12 @@ function broadcastSubtitle(room, langue, texte) {
 
 let audioPumpStarted = false;
 function attachOratorTrack(orateurId, track, pub, participant, room) {
-  if (track.kind !== 'audio' || pub.trackName !== 'orator-mic') return;
+  if (!track) return;
+  if (pub && pub.kind !== 'audio') return;
+  if (pub && pub.trackName && pub.trackName !== 'orator-mic') return;
   if (audioPumpStarted) return;
   audioPumpStarted = true;
-  log(`🎙️ Micro de l'orateur détecté (${participant.identity}), lancement traduction 7 langues...`);
+  log(`🎙️ Micro de l'orateur détecté (${participant?.identity || 'inconnu'}), lancement traduction 7 langues...`);
   LANGUES.forEach(l => getOrCreateLangSession(orateurId, l, room));
   pumpAudioTrack(orateurId, track);
 }
@@ -215,11 +216,39 @@ async function pumpAudioTrack(orateurId, track) {
   } catch(e) { log(`❌ Flux audio interrompu: ${e.message}`); }
 }
 
+// Fonction qui scanne TOUTES les pistes de TOUS les participants pour trouver l'orateur
+async function scanForOratorMic(orateurId, room) {
+  const rtc = await ensureLiveKitRtc();
+  const participants = Array.from(room.remoteParticipants.values());
+  log(`🔍 Scan des participants : ${participants.length} participant(s) dans la salle`);
+  for (const participant of participants) {
+    log(`   👤 Participant : ${participant.identity}`);
+    // ✅ ICI ON UTILISE `.publications` (nom de propriété CORRECT dans rtc-node)
+    const pubs = participant.publications ? Array.from(participant.publications.values()) : [];
+    log(`      → ${pubs.length} piste(s) publiée(s)`);
+    for (const pub of pubs) {
+      log(`      → Piste : "${pub.name}" (${pub.kind === rtc.TrackKind.KIND_AUDIO ? 'AUDIO' : 'autre'})`);
+      if (pub.kind === rtc.TrackKind.KIND_AUDIO && pub.name === 'orator-mic') {
+        log(`✅ Micro orateur trouvé chez ${participant.identity}, abonnement en cours...`);
+        try {
+          if (!pub.track) {
+            const track = await pub.setSubscribed(true);
+            attachOratorTrack(orateurId, track, pub, participant, room);
+          } else {
+            attachOratorTrack(orateurId, pub.track, pub, participant, room);
+          }
+        } catch(e) { log(`❌ Erreur abonnement micro: ${e.message}`); }
+      }
+    }
+  }
+  if (!audioPumpStarted) log(`⏳ Pas encore de micro orateur détecté, en attente des événements...`);
+}
+
 async function startBotForRoom(orateurId) {
   const orator = getOrator(orateurId);
   if (orator.bot) return orator.bot.connecting;
   if (!LIVEKIT_URL) { log('❌ LIVEKIT_URL manquante'); return; }
-  if (!GEMINI_API_KEY) { log('❌ GEMINI_API_KEY MANQUANTE dans Render ! Vérifie les variables d\'environnement.'); return; }
+  if (!GEMINI_API_KEY) { log('❌ GEMINI_API_KEY MANQUANTE dans Render !'); return; }
   audioPumpStarted = false;
   const connecting = (async () => {
     const rtc = await ensureLiveKitRtc();
@@ -227,27 +256,18 @@ async function startBotForRoom(orateurId) {
     const token = await generateLiveKitToken(orateurId, identity, 'translator');
     const room = new rtc.Room();
 
+    // Cas 1 : nouvelle piste qui arrive APRÈS la connexion du bot
     room.on(rtc.RoomEvent.TrackSubscribed, (track, pub, participant) => {
       attachOratorTrack(orateurId, track, pub, participant, room);
     });
     room.on(rtc.RoomEvent.Disconnected, () => { log(`🔌 Bot déconnecté de ${orateurId}`); if (orator.bot) orator.bot = null; });
 
     await room.connect(LIVEKIT_URL, token, { autoSubscribe: true });
-
-    log(`🔍 Vérification des micros déjà présents dans la salle...`);
-    for (const [, participant] of room.remoteParticipants) {
-      for (const [, pub] of participant.trackPublications) {
-        if (pub.kind === rtc.TrackKind.KIND_AUDIO && pub.trackName === 'orator-mic') {
-          log(`🎙️ Micro déjà présent détecté chez ${participant.identity}, abonnement...`);
-          try {
-            const track = await pub.setSubscribed(true);
-            if (track) attachOratorTrack(orateurId, track, pub, participant, room);
-          } catch(e) { log(`❌ Erreur abonnement micro: ${e.message}`); }
-        }
-      }
-    }
-    if (!audioPumpStarted) log(`⏳ En attente du micro de l'orateur...`);
     log(`✅ Bot connecté à la salle LiveKit "${orateurId}"`);
+
+    // Cas 2 : scanner les pistes déjà présentes, avec un petit délai le temps que LiveKit remplisse les participants/pistes
+    setTimeout(() => scanForOratorMic(orateurId, room), 1500);
+
     return room;
   })();
   orator.bot = { room: null, connecting };
@@ -265,7 +285,7 @@ function stopBotForRoom(id) {
 }
 
 // ROUTES
-app.get('/health', (req, res) => res.json({ ok: true, service: 'bot-traduction-studio', version: '1.0.4' }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'bot-traduction-studio', version: '1.0.5' }));
 
 app.get('/livekit-token', async (req, res) => {
   const { room, identity, role } = req.query;
@@ -294,8 +314,6 @@ app.get('/events', (req, res) => {
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
     'X-Accel-Buffering': 'no'
   });
   res.write(': connecté\n\n');
@@ -308,7 +326,7 @@ app.get('/events', (req, res) => {
 
 // DEMARRAGE
 async function main() {
-  if (!GEMINI_API_KEY) log('❌ GEMINI_API_KEY MANQUANTE dans Render ! Vérifie les variables d\'environnement.');
+  if (!GEMINI_API_KEY) log('❌ GEMINI_API_KEY MANQUANTE dans Render !');
   else {
     const mod = await import('@google/genai');
     GoogleGenAI = mod.GoogleGenAI;
