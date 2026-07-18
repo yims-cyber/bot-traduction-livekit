@@ -292,7 +292,7 @@ app.get('/livekit-token', async (req, res) => {
   if (!room || !identity) return res.status(400).json({ error: 'room et identity requis' });
   try { res.json({ token: await generateLiveKitToken(room, identity, role || 'listener') }); }
   catch(e) { res.status(500).json({ error: e.message }); }
-});
+}); 
 
 app.post('/start-session', async (req, res) => {
   const roomId = req.query.room || req.body?.room;
