@@ -49,10 +49,10 @@ async function ensureLiveKitRtc() {
   return LiveKitRtc;
 }
 
-function generateLiveKitToken(room, identity, role) {
+async function generateLiveKitToken(room, identity, role) {
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, { identity, ttl: '6h' });
   at.addGrant({ room, roomJoin: true, canPublish: role === 'orator' || role === 'translator', canSubscribe: true, canPublishData: true });
-  return at.toJwt();
+  return await at.toJwt();
 }
 
 async function saveTranscription(roomId, langue, texte) {
@@ -210,7 +210,7 @@ async function startBotForRoom(orateurId) {
   const connecting = (async () => {
     const rtc = await ensureLiveKitRtc();
     const identity = 'translator-bot-' + Math.random().toString(36).slice(2,8);
-    const token = generateLiveKitToken(orateurId, identity, 'translator');
+    const token = await generateLiveKitToken(orateurId, identity, 'translator');
     const room = new rtc.Room();
     room.on(rtc.RoomEvent.TrackSubscribed, (track, pub, participant) => {
       if (track.kind === rtc.TrackKind.KIND_AUDIO && pub.trackName === 'orator-mic') {
@@ -239,12 +239,12 @@ function stopBotForRoom(id) {
 }
 
 // ROUTES
-app.get('/health', (req, res) => res.json({ ok: true, service: 'bot-traduction-studio', version: '1.0.1' }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'bot-traduction-studio', version: '1.0.2' }));
 
-app.get('/livekit-token', (req, res) => {
+app.get('/livekit-token', async (req, res) => {
   const { room, identity, role } = req.query;
   if (!room || !identity) return res.status(400).json({ error: 'room et identity requis' });
-  try { res.json({ token: generateLiveKitToken(room, identity, role || 'listener') }); }
+  try { res.json({ token: await generateLiveKitToken(room, identity, role || 'listener') }); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
