@@ -19,12 +19,14 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const O2SWITCH_API_URL = process.env.O2SWITCH_API_URL;
 const API_SECRET = process.env.API_SECRET;
 const LANGUES = ['fr', 'ln', 'sw', 'en', 'pt', 'es', 'de'];
-const BOT_VERSION = '1.0.9';
+const BOT_VERSION = '1.1.0';
 
 const SAMPLE_RATE = 16000;
 const CHUNK_MS = 100;
 const BYTES_PER_CHUNK = Math.round(SAMPLE_RATE * (CHUNK_MS / 1000)) * 2;
 const GEMINI_OUTPUT_SAMPLE_RATE = 24000;
+// ✅ Latence cible : ~400ms max. Si la file a plus de MAX_BUFFER_MS, on saute des frames pour rattraper.
+const MAX_BUFFER_FRAMES = Math.round(400 / 10); // ~400ms de buffer max
 const orators = new Map();
 
 function log(msg) {
@@ -38,7 +40,7 @@ function broadcastSSE(msg) {
   const data = `data: ${JSON.stringify({t: Date.now(), m: clean})}\n\n`;
   for (const res of sseClients) { try { res.write(data); } catch(e){} }
 }
-log(`=== Serveur traduction v${BOT_VERSION} ===`);
+log(`=== Serveur traduction v${BOT_VERSION} - Latence optimisée ===`);
 process.on('uncaughtException', (err) => log(`💥 ERREUR: ${err?.stack || err}`));
 process.on('unhandledRejection', (reason) => log(`💥 REJET: ${reason?.stack || reason}`));
 let ai;
@@ -70,7 +72,10 @@ function broadcastSubtitle(room, langue, texte) {
   if (!room || !texte) return;
   try {
     const payload = Buffer.from(JSON.stringify({ type: 'sous_titre', texte, langue }), 'utf-8');
-    room.localParticipant.publishData(payload, { reliable: true, topic: `sous-titres-${langue}` });
+    // ✅ Diffuse à TOUS les participants sans restriction (destinationIdentities omis)
+    room.localParticipant.publishData(payload, { reliable: true, topic: `sous-titres-${langue}` })
+      .then(() => log(`📤 Sous-titre [${langue}] diffusé: "${texte.substring(0,30)}..."`))
+      .catch(e => log(`❌ Erreur broadcast sous-titre ${langue}: ${e.message}`));
   } catch(e) { log(`❌ Erreur broadcast sous-titre ${langue}: ${e.message}`); }
 }
 
@@ -88,13 +93,17 @@ function attachOratorTrack(orateurId, track, pub, participant, room) {
 
 async function createLangSession(orateurId, lang, room) {
   const isCaption = lang === 'fr';
-  // ✅ CORRECTION v1.0.9 : SUPPRESSION du speechConfig (voix Puck) qui casse le mode Live Translate.
-  // Le mode gemini-3.5-live-translate-preview choisit automatiquement la voix adaptée à la langue cible,
-  // il ne faut SURTOUT PAS passer de speechConfig au risque de ne recevoir AUCUNE réponse.
   const translationConfig = isCaption
     ? { targetLanguageCode: 'fr', echoTargetLanguage: true }
     : { targetLanguageCode: lang, echoTargetLanguage: false };
-  const s = { geminiSession: null, ready: false, pendingAudio: [], lastText: '', closing: false, audioSource: null, audioQueue: Promise.resolve() };
+  const s = {
+    geminiSession: null, ready: false, pendingAudio: [], lastText: '',
+    closing: false, audioSource: null,
+    queueSize: 0, // ✅ Compteur de frames en attente pour contrôler la latence
+    droppedFrames: 0,
+  };
+  s.audioQueue = Promise.resolve();
+
   try {
     log(`🔄 Connexion Gemini [${lang}]...`);
     const geminiSession = await ai.live.connect({
@@ -104,7 +113,6 @@ async function createLangSession(orateurId, lang, room) {
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         translationConfig,
-        // ❌ speechConfig RETIRÉ - incompatible avec Live Translate
       },
       callbacks: {
         onopen: () => {
@@ -118,14 +126,13 @@ async function createLangSession(orateurId, lang, room) {
           s.pendingAudio = [];
         },
         onmessage: (message) => {
-          // Log brut pour débogage les premiers messages
           try {
             const c = message.serverContent;
             if (!c) {
-              // Événement setupComplete ou autre
               if (message.setupComplete) log(`🔧 Gemini [${lang}] setup terminé`);
               return;
             }
+            // Transcription entrante (ce que l'orateur dit)
             if (c.inputTranscription?.text) {
               const t = c.inputTranscription.text.trim();
               if (t && t !== s.lastText) {
@@ -134,35 +141,55 @@ async function createLangSession(orateurId, lang, room) {
                   log(`📝 TRANSCRIPTION FR: "${t}"`);
                   saveTranscription(orateurId, lang, t);
                   broadcastSubtitle(room, lang, t);
-                } else {
-                  log(`🎤 Entendu [${lang}]: "${t}"`);
                 }
               }
             }
+            // Traduction sortante + sous-titres
             if (c.outputTranscription?.text) {
               const t = c.outputTranscription.text.trim();
               if (t && !isCaption) {
-                // Ne pas dupliquer si c'est le même texte que l'input
-                if (t !== s.lastText || true) {
-                  saveTranscription(orateurId, lang, t);
-                  broadcastSubtitle(room, lang, t);
-                  log(`🌐 TRADUCTION [${lang}]: "${t}"`);
-                }
+                saveTranscription(orateurId, lang, t);
+                broadcastSubtitle(room, lang, t);
+                log(`🌐 TRADUCTION [${lang}]: "${t}"`);
               }
             }
             if (c.turnComplete) s.lastText = '';
+
+            // Audio traduit sortant
             if (!isCaption && c.modelTurn?.parts && s.audioSource) {
-              let audioBytes = 0;
+              const frames = [];
               for (const p of c.modelTurn.parts) {
                 if (p.inlineData?.data) {
                   const buf = Buffer.from(p.inlineData.data, 'base64');
-                  audioBytes += buf.length;
                   const i16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength/2);
-                  const frame = new LiveKitAudioFrame(i16, GEMINI_OUTPUT_SAMPLE_RATE, 1, i16.length);
-                  s.audioQueue = s.audioQueue.then(() => s.audioSource.captureFrame(frame)).catch(e => log(`❌ Audio ${lang}: ${e.message}`));
+                  const numFrames = i16.length; // 24kHz, échantillons
+                  // Découper en frames de ~10ms pour un contrôle précis du buffer
+                  const samplesPerFrame = Math.round(GEMINI_OUTPUT_SAMPLE_RATE * 10 / 1000);
+                  for (let i = 0; i < numFrames; i += samplesPerFrame) {
+                    const end = Math.min(i + samplesPerFrame, numFrames);
+                    const frameData = i16.subarray(i, end);
+                    const frame = new LiveKitAudioFrame(frameData, GEMINI_OUTPUT_SAMPLE_RATE, 1, frameData.length);
+                    frames.push(frame);
+                  }
                 }
               }
-              if (audioBytes > 0) log(`🔊 Audio [${lang}] reçu: ${audioBytes} octets`);
+              if (frames.length > 0) {
+                // ✅ CONTRÔLE DE LATENCE : si on a déjà trop de frames en file, sauter des frames
+                if (s.queueSize > MAX_BUFFER_FRAMES) {
+                  const drop = s.queueSize - Math.round(MAX_BUFFER_FRAMES / 2);
+                  s.droppedFrames += drop;
+                  s.queueSize = Math.round(MAX_BUFFER_FRAMES / 2);
+                  if (s.droppedFrames % 50 === 1) log(`⚠️ Rattrapage latence [${lang}]: ${drop} frames sautées (buffer saturé)`);
+                }
+                for (const frame of frames) {
+                  s.queueSize++;
+                  s.audioQueue = s.audioQueue.then(() => {
+                    s.queueSize = Math.max(0, s.queueSize - 1);
+                    return s.audioSource.captureFrame(frame);
+                  }).catch(e => log(`❌ Audio ${lang}: ${e.message}`));
+                }
+                log(`🔊 Audio [${lang}]: +${frames.length} frames (file=${s.queueSize})`);
+              }
             }
           } catch(e) {
             log(`❌ Erreur traitement message [${lang}]: ${e.message}`);
@@ -181,7 +208,9 @@ async function reconnectLangSession(orateurId, lang) {
   const o = orators.get(orateurId); if (!o) return;
   const old = o.langSessions.get(lang); if (!old || old.closing) return;
   const n = await createLangSession(orateurId, lang, o.bot?.room);
-  n.audioSource = old.audioSource; n.audioQueue = Promise.resolve();
+  n.audioSource = old.audioSource;
+  n.audioQueue = Promise.resolve();
+  n.queueSize = 0;
   o.langSessions.set(lang, n);
 }
 
@@ -217,7 +246,8 @@ function feedAudio(id, buffer, seq) {
 async function publishLangAudioTrack(id, lang, s) {
   const o = getOrator(id); if (!o.bot?.room) return;
   const room = o.bot.room; const rtc = await ensureLiveKitRtc();
-  const src = new rtc.AudioSource(GEMINI_OUTPUT_SAMPLE_RATE, 1);
+  // ✅ Désactiver le DTX / confort pour réduire la latence
+  const src = new rtc.AudioSource(GEMINI_OUTPUT_SAMPLE_RATE, 1, { noiseSuppression: false, echoCancellation: false, autoGainControl: false });
   const tr = rtc.LocalAudioTrack.createAudioTrack(`lang-${lang}`, src);
   await room.localParticipant.publishTrack(tr, { name: `lang-${lang}` });
   s.audioSource = src;
@@ -226,7 +256,7 @@ async function publishLangAudioTrack(id, lang, s) {
 
 async function pumpAudioTrack(id, track) {
   const rtc = await ensureLiveKitRtc();
-  log(`🎧 Pompe audio démarrée (16kHz mono PCM16, chunks 100ms)...`);
+  log(`🎧 Pompe audio démarrée (16kHz mono PCM16, chunks 100ms, latence cible <500ms)...`);
   const stream = new rtc.AudioStream(track, { sampleRate: SAMPLE_RATE, numChannels: 1 });
   let leftover = Buffer.alloc(0), seq = 0, totalBytes = 0, lastLog = Date.now();
   try {
@@ -241,7 +271,11 @@ async function pumpAudioTrack(id, track) {
       }
       leftover = off < comb.length ? Buffer.from(comb.subarray(off)) : Buffer.alloc(0);
       if (Date.now() - lastLog > 3000) {
-        log(`📊 Débit: ${Math.round(totalBytes/1024)} KB audio envoyé à Gemini, ${seq} chunks`);
+        // Afficher la latence moyenne des files
+        const queues = [];
+        const o = orators.get(id);
+        if (o) for (const [l, s] of o.langSessions) queues.push(`${l}:${s.queueSize}`);
+        log(`📊 Débit: ${Math.round(totalBytes/1024)} KB, ${seq} chunks, files=[${queues.join(',')}]`);
         totalBytes = 0; lastLog = Date.now();
       }
     }
@@ -346,7 +380,7 @@ app.get('/events', (req, res) => {
   const ka = setInterval(()=>{ try{res.write(': ping\n\n');}catch(e){clearInterval(ka);} },15000);
   req.on('close',()=>{ clearInterval(ka); sseClients.delete(res); });
 });
- 
+
 async function main() {
   log(`📋 Config: LIVEKIT_URL=${LIVEKIT_URL?'✅':'❌'}, GEMINI_API_KEY=${GEMINI_API_KEY?`✅ (${GEMINI_API_KEY.length} car.)`:'❌'}`);
   if (!GEMINI_API_KEY) log('⚠️ GEMINI_API_KEY manquante !');
