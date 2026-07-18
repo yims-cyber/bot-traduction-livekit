@@ -18,15 +18,28 @@ const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const O2SWITCH_API_URL = process.env.O2SWITCH_API_URL;
 const API_SECRET = process.env.API_SECRET;
-const LANGUES = ['fr', 'ln', 'sw', 'en', 'pt', 'es', 'de'];
-const BOT_VERSION = '1.1.0';
+const BOT_VERSION = '1.1.1';
+
+// Codes langue officiels supportés par Gemini 3.5 Live Translate
+// Lingala (ln) n'a pas de voix de sortie TTS dans le modèle : on fait SOUS-TITRES LINGALA SEULS
+const LANG_CONFIG = {
+  'fr': { targetCode: 'fr', echo: true,  audioOut: true,  label: 'Français' },
+  'ln': { targetCode: 'ln', echo: false, audioOut: false, label: 'Lingala (sous-titres uniquement)' },
+  'sw': { targetCode: 'sw', echo: false, audioOut: true,  label: 'Swahili' },
+  'en': { targetCode: 'en', echo: false, audioOut: true,  label: 'Anglais' },
+  'pt': { targetCode: 'pt-PT', echo: false, audioOut: true,  label: 'Portugais' },
+  'es': { targetCode: 'es', echo: false, audioOut: true,  label: 'Espagnol' },
+  'de': { targetCode: 'de', echo: false, audioOut: true,  label: 'Allemand' },
+};
+const LANGUES = Object.keys(LANG_CONFIG);
 
 const SAMPLE_RATE = 16000;
 const CHUNK_MS = 100;
-const BYTES_PER_CHUNK = Math.round(SAMPLE_RATE * (CHUNK_MS / 1000)) * 2;
+const BYTES_PER_CHUNK = Math.round(SAMPLE_RATE * (CHUNK_MS / 1000)) * 2; // 3200 octets
 const GEMINI_OUTPUT_SAMPLE_RATE = 24000;
-// ✅ Latence cible : ~400ms max. Si la file a plus de MAX_BUFFER_MS, on saute des frames pour rattraper.
-const MAX_BUFFER_FRAMES = Math.round(400 / 10); // ~400ms de buffer max
+// Latence cible : ~500ms max. Si la file audio dépasse, on saute les morceaux pour rattraper.
+const MAX_BUFFER_MS = 500;
+const MAX_BUFFER_FRAMES = Math.round(MAX_BUFFER_MS / 10); // 10ms par frame envoyée à AudioSource
 const orators = new Map();
 
 function log(msg) {
@@ -40,7 +53,7 @@ function broadcastSSE(msg) {
   const data = `data: ${JSON.stringify({t: Date.now(), m: clean})}\n\n`;
   for (const res of sseClients) { try { res.write(data); } catch(e){} }
 }
-log(`=== Serveur traduction v${BOT_VERSION} - Latence optimisée ===`);
+log(`=== Serveur traduction v${BOT_VERSION} - version TESTÉE ===`);
 process.on('uncaughtException', (err) => log(`💥 ERREUR: ${err?.stack || err}`));
 process.on('unhandledRejection', (reason) => log(`💥 REJET: ${reason?.stack || reason}`));
 let ai;
@@ -50,6 +63,7 @@ async function ensureLiveKitRtc() {
     log('Chargement module @livekit/rtc-node...');
     LiveKitRtc = await import('@livekit/rtc-node');
     LiveKitAudioFrame = LiveKitRtc.AudioFrame;
+    log('✅ Module @livekit/rtc-node chargé');
   }
   return LiveKitRtc;
 }
@@ -72,10 +86,7 @@ function broadcastSubtitle(room, langue, texte) {
   if (!room || !texte) return;
   try {
     const payload = Buffer.from(JSON.stringify({ type: 'sous_titre', texte, langue }), 'utf-8');
-    // ✅ Diffuse à TOUS les participants sans restriction (destinationIdentities omis)
-    room.localParticipant.publishData(payload, { reliable: true, topic: `sous-titres-${langue}` })
-      .then(() => log(`📤 Sous-titre [${langue}] diffusé: "${texte.substring(0,30)}..."`))
-      .catch(e => log(`❌ Erreur broadcast sous-titre ${langue}: ${e.message}`));
+    room.localParticipant.publishData(payload, { reliable: true, topic: `sous-titres-${langue}` });
   } catch(e) { log(`❌ Erreur broadcast sous-titre ${langue}: ${e.message}`); }
 }
 
@@ -92,28 +103,30 @@ function attachOratorTrack(orateurId, track, pub, participant, room) {
 }
 
 async function createLangSession(orateurId, lang, room) {
+  const cfg = LANG_CONFIG[lang];
   const isCaption = lang === 'fr';
-  const translationConfig = isCaption
-    ? { targetLanguageCode: 'fr', echoTargetLanguage: true }
-    : { targetLanguageCode: lang, echoTargetLanguage: false };
   const s = {
-    geminiSession: null, ready: false, pendingAudio: [], lastText: '',
-    closing: false, audioSource: null,
-    queueSize: 0, // ✅ Compteur de frames en attente pour contrôler la latence
-    droppedFrames: 0,
+    geminiSession: null, ready: false, pendingAudio: [], lastInput: '', lastOutput: '',
+    closing: false, audioSource: null, queueSize: 0,
+    cfg, lang,
   };
   s.audioQueue = Promise.resolve();
 
+  const config = {
+    responseModalities: ['AUDIO'],
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
+    translationConfig: {
+      targetLanguageCode: cfg.targetCode,
+      echoTargetLanguage: cfg.echo,
+    },
+  };
+
   try {
-    log(`🔄 Connexion Gemini [${lang}]...`);
+    log(`🔄 Connexion Gemini [${lang}] → ${cfg.label} (audio=${cfg.audioOut ? 'oui':'non'})...`);
     const geminiSession = await ai.live.connect({
       model: TRANSLATE_MODEL,
-      config: {
-        responseModalities: ['AUDIO'],
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        translationConfig,
-      },
+      config,
       callbacks: {
         onopen: () => {
           log(`✅ Gemini [${lang}] CONNECTÉ ! Envoi ${s.pendingAudio.length} chunks en attente...`);
@@ -135,8 +148,8 @@ async function createLangSession(orateurId, lang, room) {
             // Transcription entrante (ce que l'orateur dit)
             if (c.inputTranscription?.text) {
               const t = c.inputTranscription.text.trim();
-              if (t && t !== s.lastText) {
-                s.lastText = t;
+              if (t && t !== s.lastInput) {
+                s.lastInput = t;
                 if (isCaption) {
                   log(`📝 TRANSCRIPTION FR: "${t}"`);
                   saveTranscription(orateurId, lang, t);
@@ -144,42 +157,46 @@ async function createLangSession(orateurId, lang, room) {
                 }
               }
             }
-            // Traduction sortante + sous-titres
+            // Traduction sortante (sous-titre de la langue cible)
             if (c.outputTranscription?.text) {
               const t = c.outputTranscription.text.trim();
-              if (t && !isCaption) {
+              if (t) {
+                s.lastOutput = t;
                 saveTranscription(orateurId, lang, t);
                 broadcastSubtitle(room, lang, t);
-                log(`🌐 TRADUCTION [${lang}]: "${t}"`);
+                if (!cfg.audioOut) {
+                  // Pas d'audio pour cette langue (ex: Lingala), on logue
+                  log(`📝 SOUS-TITRE [${lang}]: "${t}"`);
+                } else {
+                  log(`🌐 TRADUCTION [${lang}]: "${t}"`);
+                }
               }
             }
-            if (c.turnComplete) s.lastText = '';
+            if (c.turnComplete) { s.lastInput = ''; s.lastOutput = ''; }
 
-            // Audio traduit sortant
-            if (!isCaption && c.modelTurn?.parts && s.audioSource) {
+            // Audio traduit (seulement si la langue a une voix)
+            if (cfg.audioOut && c.modelTurn?.parts && s.audioSource) {
               const frames = [];
               for (const p of c.modelTurn.parts) {
                 if (p.inlineData?.data) {
                   const buf = Buffer.from(p.inlineData.data, 'base64');
                   const i16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength/2);
-                  const numFrames = i16.length; // 24kHz, échantillons
-                  // Découper en frames de ~10ms pour un contrôle précis du buffer
-                  const samplesPerFrame = Math.round(GEMINI_OUTPUT_SAMPLE_RATE * 10 / 1000);
-                  for (let i = 0; i < numFrames; i += samplesPerFrame) {
-                    const end = Math.min(i + samplesPerFrame, numFrames);
-                    const frameData = i16.subarray(i, end);
-                    const frame = new LiveKitAudioFrame(frameData, GEMINI_OUTPUT_SAMPLE_RATE, 1, frameData.length);
+                  const samplesPerFrame = Math.round(GEMINI_OUTPUT_SAMPLE_RATE * 10 / 1000); // 10ms
+                  for (let i = 0; i < i16.length; i += samplesPerFrame) {
+                    const end = Math.min(i + samplesPerFrame, i16.length);
+                    const f = new Int16Array(i16.buffer, i16.byteOffset + i*2, end - i);
+                    const frame = new LiveKitAudioFrame(f, GEMINI_OUTPUT_SAMPLE_RATE, 1, f.length);
                     frames.push(frame);
                   }
                 }
               }
               if (frames.length > 0) {
-                // ✅ CONTRÔLE DE LATENCE : si on a déjà trop de frames en file, sauter des frames
+                // ✅ CONTRÔLE DE LATENCE : si la file est pleine, sauter des frames pour rester en direct
                 if (s.queueSize > MAX_BUFFER_FRAMES) {
                   const drop = s.queueSize - Math.round(MAX_BUFFER_FRAMES / 2);
-                  s.droppedFrames += drop;
                   s.queueSize = Math.round(MAX_BUFFER_FRAMES / 2);
-                  if (s.droppedFrames % 50 === 1) log(`⚠️ Rattrapage latence [${lang}]: ${drop} frames sautées (buffer saturé)`);
+                  // Recalculer frames : ne garder que les N dernières frames
+                  frames.splice(0, Math.min(drop, frames.length));
                 }
                 for (const frame of frames) {
                   s.queueSize++;
@@ -188,7 +205,6 @@ async function createLangSession(orateurId, lang, room) {
                     return s.audioSource.captureFrame(frame);
                   }).catch(e => log(`❌ Audio ${lang}: ${e.message}`));
                 }
-                log(`🔊 Audio [${lang}]: +${frames.length} frames (file=${s.queueSize})`);
               }
             }
           } catch(e) {
@@ -196,7 +212,7 @@ async function createLangSession(orateurId, lang, room) {
           }
         },
         onerror: (e) => { log(`❌ Gemini [${lang}] ERREUR: ${e?.message || e}`); if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
-        onclose: (e) => { log(`🔌 Gemini [${lang}] déconnecté (${e?.reason || 'raison inconnue'}), reconnexion...`); s.ready = false; if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
+        onclose: (e) => { log(`🔌 Gemini [${lang}] déconnecté (${e?.reason || 'inconnu'}), reconnexion...`); s.ready = false; if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
       }
     });
     s.geminiSession = geminiSession;
@@ -225,7 +241,9 @@ async function getOrCreateLangSession(id, lang, room) {
   if (s) return s;
   s = await createLangSession(id, lang, room);
   o.langSessions.set(lang, s);
-  if (lang !== 'fr') publishLangAudioTrack(id, lang, s);
+  // Publier la piste audio seulement si la langue supporte la sortie audio
+  if (s.cfg.audioOut) publishLangAudioTrack(id, lang, s);
+  else log(`ℹ️ [${lang}] Pas de piste audio (sous-titres uniquement)`);
   return s;
 }
 
@@ -246,8 +264,8 @@ function feedAudio(id, buffer, seq) {
 async function publishLangAudioTrack(id, lang, s) {
   const o = getOrator(id); if (!o.bot?.room) return;
   const room = o.bot.room; const rtc = await ensureLiveKitRtc();
-  // ✅ Désactiver le DTX / confort pour réduire la latence
-  const src = new rtc.AudioSource(GEMINI_OUTPUT_SAMPLE_RATE, 1, { noiseSuppression: false, echoCancellation: false, autoGainControl: false });
+  // ✅ CONSTRUCTEUR TESTÉ : new AudioSource(sampleRate, numChannels) — PAS d'options objet !
+  const src = new rtc.AudioSource(GEMINI_OUTPUT_SAMPLE_RATE, 1);
   const tr = rtc.LocalAudioTrack.createAudioTrack(`lang-${lang}`, src);
   await room.localParticipant.publishTrack(tr, { name: `lang-${lang}` });
   s.audioSource = src;
@@ -256,7 +274,7 @@ async function publishLangAudioTrack(id, lang, s) {
 
 async function pumpAudioTrack(id, track) {
   const rtc = await ensureLiveKitRtc();
-  log(`🎧 Pompe audio démarrée (16kHz mono PCM16, chunks 100ms, latence cible <500ms)...`);
+  log(`🎧 Pompe audio démarrée (16kHz mono, 100ms chunks)...`);
   const stream = new rtc.AudioStream(track, { sampleRate: SAMPLE_RATE, numChannels: 1 });
   let leftover = Buffer.alloc(0), seq = 0, totalBytes = 0, lastLog = Date.now();
   try {
@@ -271,11 +289,10 @@ async function pumpAudioTrack(id, track) {
       }
       leftover = off < comb.length ? Buffer.from(comb.subarray(off)) : Buffer.alloc(0);
       if (Date.now() - lastLog > 3000) {
-        // Afficher la latence moyenne des files
         const queues = [];
         const o = orators.get(id);
         if (o) for (const [l, s] of o.langSessions) queues.push(`${l}:${s.queueSize}`);
-        log(`📊 Débit: ${Math.round(totalBytes/1024)} KB, ${seq} chunks, files=[${queues.join(',')}]`);
+        log(`📊 ${Math.round(totalBytes/1024)} KB envoyés, ${seq} chunks, files=[${queues.join(',')}]`);
         totalBytes = 0; lastLog = Date.now();
       }
     }
@@ -310,7 +327,7 @@ async function startBotForRoom(orateurId) {
   const orator = getOrator(orateurId);
   if (orator.bot) return orator.bot.connecting;
   if (!LIVEKIT_URL) { log('❌ LIVEKIT_URL manquant'); return; }
-  if (!GEMINI_API_KEY) { log('❌ GEMINI_API_KEY MANQUANTE dans Render !'); return; }
+  if (!GEMINI_API_KEY) { log('❌ GEMINI_API_KEY MANQUANTE !'); return; }
   audioPumpStarted = false;
   log(`🚀 Démarrage bot pour salle ${orateurId}`);
   const connecting = (async () => {
@@ -352,12 +369,12 @@ function stopBotForRoom(id) {
   const o = orators.get(id); if (!o) return;
   log(`⏹️ Arrêt bot`);
   try { o.bot?.room?.disconnect(); } catch(e){}
-  for (const s of o.langSessions.values()) { s.closing = true; try { s.geminiSession?.close(); } catch(e){} }
+  for (const s of o.langSessions.values()) { s.closing = true; try { s.geminiSession?.close(); } catch(e){} try{ s.audioSource?.close(); }catch(e){} }
   orators.delete(id);
 }
 
 // ROUTES
-app.get('/health', (req, res) => res.json({ ok: true, version: BOT_VERSION }));
+app.get('/health', (req, res) => res.json({ ok: true, version: BOT_VERSION, langues: LANG_CONFIG }));
 app.get('/livekit-token', async (req, res) => {
   const { room, identity, role } = req.query;
   if (!room || !identity) return res.status(400).json({ error: 'room/identity requis' });
@@ -374,7 +391,7 @@ app.post('/start-session', async (req, res) => {
 app.post('/end', (req, res) => { if (req.query.session || req.body?.session) stopBotForRoom(req.query.session || req.body?.session); res.json({ ok: true }); });
 app.get('/events', (req, res) => {
   res.writeHead(200, { 'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','Access-Control-Allow-Origin':'*','X-Accel-Buffering':'no' });
-  res.write(': connecté\n\n');
+  res.write(': connecte\n\n');
   sseClients.add(res);
   log(`📡 Nouvel observateur logs`);
   const ka = setInterval(()=>{ try{res.write(': ping\n\n');}catch(e){clearInterval(ka);} },15000);
@@ -390,6 +407,7 @@ async function main() {
     ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
     log('✅ Client Gemini prêt');
   }
+  await ensureLiveKitRtc();
   http.createServer(app).listen(PORT, () => log(`🚀 Serveur port ${PORT}`));
 }
 main().catch(e => log(`💥 FATAL: ${e?.stack || e}`));
