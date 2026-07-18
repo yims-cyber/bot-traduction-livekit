@@ -74,6 +74,17 @@ function broadcastSubtitle(room, langue, texte) {
   } catch(e) {}
 }
 
+// Fonction qui attache le flux audio d'une piste orateur au pipeline de traduction
+let audioPumpStarted = false;
+function attachOratorTrack(orateurId, track, pub, participant, room) {
+  if (track.kind !== 'audio' || pub.trackName !== 'orator-mic') return;
+  if (audioPumpStarted) return; // évite les doublons
+  audioPumpStarted = true;
+  log(`🎙️ Micro de l'orateur détecté (${participant.identity}), lancement traduction 7 langues...`);
+  LANGUES.forEach(l => getOrCreateLangSession(orateurId, l, room));
+  pumpAudioTrack(orateurId, track);
+}
+
 async function createLangSession(orateurId, lang, room) {
   const isCaption = lang === 'fr';
   const translationConfig = isCaption
@@ -207,21 +218,38 @@ async function startBotForRoom(orateurId) {
   const orator = getOrator(orateurId);
   if (orator.bot) return orator.bot.connecting;
   if (!LIVEKIT_URL || !GEMINI_API_KEY) { log('❌ Configuration incomplète'); return; }
+  audioPumpStarted = false; // reset pour chaque nouvelle session
   const connecting = (async () => {
     const rtc = await ensureLiveKitRtc();
     const identity = 'translator-bot-' + Math.random().toString(36).slice(2,8);
     const token = await generateLiveKitToken(orateurId, identity, 'translator');
     const room = new rtc.Room();
+
+    // Cas 1 : une piste est publiée APRÈS que le bot soit connecté
     room.on(rtc.RoomEvent.TrackSubscribed, (track, pub, participant) => {
-      if (track.kind === rtc.TrackKind.KIND_AUDIO && pub.trackName === 'orator-mic') {
-        log(`🎙️ Micro orateur détecté, lancement traduction 7 langues...`);
-        LANGUES.forEach(l => getOrCreateLangSession(orateurId, l, room));
-        pumpAudioTrack(orateurId, track);
-      }
+      attachOratorTrack(orateurId, track, pub, participant, room);
     });
     room.on(rtc.RoomEvent.Disconnected, () => { log(`🔌 Bot déconnecté de ${orateurId}`); if (orator.bot) orator.bot = null; });
+
     await room.connect(LIVEKIT_URL, token, { autoSubscribe: true });
-    log(`✅ Bot connecté à la salle LiveKit "${orateurId}", en attente du micro...`);
+
+    // Cas 2 : le micro est DÉJÀ publié quand le bot arrive (notre bug !)
+    // On parcourt tous les participants déjà présents dans la salle
+    log(`🔍 Recherche du micro de l'orateur déjà présent dans la salle...`);
+    for (const [, participant] of room.remoteParticipants) {
+      for (const [, pub] of participant.trackPublications) {
+        if (pub.kind === rtc.TrackKind.KIND_AUDIO && pub.trackName === 'orator-mic') {
+          log(`🎙️ Micro déjà présent détecté chez ${participant.identity}, abonnement...`);
+          try {
+            const track = await pub.setSubscribed(true);
+            if (track) attachOratorTrack(orateurId, track, pub, participant, room);
+          } catch(e) { log(`❌ Erreur abonnement micro existant: ${e.message}`); }
+        }
+      }
+    }
+
+    if (!audioPumpStarted) log(`⏳ En attente du micro de l'orateur...`);
+    log(`✅ Bot connecté à la salle LiveKit "${orateurId}"`);
     return room;
   })();
   orator.bot = { room: null, connecting };
@@ -239,7 +267,7 @@ function stopBotForRoom(id) {
 }
 
 // ROUTES
-app.get('/health', (req, res) => res.json({ ok: true, service: 'bot-traduction-studio', version: '1.0.2' }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'bot-traduction-studio', version: '1.0.3' }));
 
 app.get('/livekit-token', async (req, res) => {
   const { room, identity, role } = req.query;
