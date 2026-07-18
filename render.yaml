@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: bot-traduction-studio
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: LIVEKIT_API_KEY
+        value: APIMSYRXvY3U55b
+      - key: LIVEKIT_API_SECRET
+        value: XZkNsxlFqJzrDtWzxye4eUy5Dq2HricrjNftPP4GgMPB
+      - key: LIVEKIT_URL
+        value: wss://bot-traduction-qrchakbo.livekit.cloud
+      - key: O2SWITCH_API_URL
+        value: https://studio.zaloriatech.com/api
+      - key: API_SECRET
+        value: StudioOrateurTraduction2026CleSecreteMatadiCD
+      - key: GEMINI_API_KEY
+        sync: false # Tu rempliras cette valeur directement dans Render
