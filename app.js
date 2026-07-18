@@ -346,7 +346,7 @@ app.get('/events', (req, res) => {
   const ka = setInterval(()=>{ try{res.write(': ping\n\n');}catch(e){clearInterval(ka);} },15000);
   req.on('close',()=>{ clearInterval(ka); sseClients.delete(res); });
 });
-
+ 
 async function main() {
   log(`📋 Config: LIVEKIT_URL=${LIVEKIT_URL?'✅':'❌'}, GEMINI_API_KEY=${GEMINI_API_KEY?`✅ (${GEMINI_API_KEY.length} car.)`:'❌'}`);
   if (!GEMINI_API_KEY) log('⚠️ GEMINI_API_KEY manquante !');
