@@ -19,6 +19,7 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const O2SWITCH_API_URL = process.env.O2SWITCH_API_URL;
 const API_SECRET = process.env.API_SECRET;
 const LANGUES = ['fr', 'ln', 'sw', 'en', 'pt', 'es', 'de'];
+const BOT_VERSION = '1.0.9';
 
 const SAMPLE_RATE = 16000;
 const CHUNK_MS = 100;
@@ -37,7 +38,7 @@ function broadcastSSE(msg) {
   const data = `data: ${JSON.stringify({t: Date.now(), m: clean})}\n\n`;
   for (const res of sseClients) { try { res.write(data); } catch(e){} }
 }
-log('=== Serveur traduction v1.0.8 DERNIÈRE CORRECTION ===');
+log(`=== Serveur traduction v${BOT_VERSION} ===`);
 process.on('uncaughtException', (err) => log(`💥 ERREUR: ${err?.stack || err}`));
 process.on('unhandledRejection', (reason) => log(`💥 REJET: ${reason?.stack || reason}`));
 let ai;
@@ -70,7 +71,7 @@ function broadcastSubtitle(room, langue, texte) {
   try {
     const payload = Buffer.from(JSON.stringify({ type: 'sous_titre', texte, langue }), 'utf-8');
     room.localParticipant.publishData(payload, { reliable: true, topic: `sous-titres-${langue}` });
-  } catch(e) {}
+  } catch(e) { log(`❌ Erreur broadcast sous-titre ${langue}: ${e.message}`); }
 }
 
 let audioPumpStarted = false;
@@ -87,6 +88,9 @@ function attachOratorTrack(orateurId, track, pub, participant, room) {
 
 async function createLangSession(orateurId, lang, room) {
   const isCaption = lang === 'fr';
+  // ✅ CORRECTION v1.0.9 : SUPPRESSION du speechConfig (voix Puck) qui casse le mode Live Translate.
+  // Le mode gemini-3.5-live-translate-preview choisit automatiquement la voix adaptée à la langue cible,
+  // il ne faut SURTOUT PAS passer de speechConfig au risque de ne recevoir AUCUNE réponse.
   const translationConfig = isCaption
     ? { targetLanguageCode: 'fr', echoTargetLanguage: true }
     : { targetLanguageCode: lang, echoTargetLanguage: false };
@@ -100,7 +104,7 @@ async function createLangSession(orateurId, lang, room) {
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         translationConfig,
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } }
+        // ❌ speechConfig RETIRÉ - incompatible avec Live Translate
       },
       callbacks: {
         onopen: () => {
@@ -108,43 +112,64 @@ async function createLangSession(orateurId, lang, room) {
           s.ready = true;
           s.pendingAudio.sort((a,b)=>a.seq-b.seq).forEach(({buf}) => {
             try {
-              // ✅ NOM DE CHAMP CORRIGÉ : media PAS audio
               geminiSession.sendRealtimeInput({ media: { data: buf.toString('base64'), mimeType: 'audio/pcm;rate=16000' } });
             } catch(e) { log(`❌ Erreur envoi chunk attente [${lang}]: ${e.message}`); }
           });
           s.pendingAudio = [];
         },
         onmessage: (message) => {
-          const c = message.serverContent; if (!c) return;
-          if (c.inputTranscription?.text) {
-            const t = c.inputTranscription.text.trim();
-            if (t && t !== s.lastText) {
-              s.lastText = t;
-              if (isCaption) { log(`📝 TRANSCRIPTION FR: "${t}"`); saveTranscription(orateurId, lang, t); broadcastSubtitle(room, lang, t); }
+          // Log brut pour débogage les premiers messages
+          try {
+            const c = message.serverContent;
+            if (!c) {
+              // Événement setupComplete ou autre
+              if (message.setupComplete) log(`🔧 Gemini [${lang}] setup terminé`);
+              return;
             }
-          }
-          if (c.outputTranscription?.text) {
-            const t = c.outputTranscription.text.trim();
-            if (t && !isCaption && t !== s.lastText) {
-              s.lastText = t;
-              saveTranscription(orateurId, lang, t); broadcastSubtitle(room, lang, t);
-              log(`🌐 TRADUCTION [${lang}]: "${t}"`);
-            }
-          }
-          if (c.turnComplete) s.lastText = '';
-          if (!isCaption && c.modelTurn?.parts && s.audioSource) {
-            for (const p of c.modelTurn.parts) {
-              if (p.inlineData?.data) {
-                const buf = Buffer.from(p.inlineData.data, 'base64');
-                const i16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength/2);
-                const frame = new LiveKitAudioFrame(i16, GEMINI_OUTPUT_SAMPLE_RATE, 1, i16.length);
-                s.audioQueue = s.audioQueue.then(() => s.audioSource.captureFrame(frame)).catch(e => log(`❌ Audio ${lang}: ${e.message}`));
+            if (c.inputTranscription?.text) {
+              const t = c.inputTranscription.text.trim();
+              if (t && t !== s.lastText) {
+                s.lastText = t;
+                if (isCaption) {
+                  log(`📝 TRANSCRIPTION FR: "${t}"`);
+                  saveTranscription(orateurId, lang, t);
+                  broadcastSubtitle(room, lang, t);
+                } else {
+                  log(`🎤 Entendu [${lang}]: "${t}"`);
+                }
               }
             }
+            if (c.outputTranscription?.text) {
+              const t = c.outputTranscription.text.trim();
+              if (t && !isCaption) {
+                // Ne pas dupliquer si c'est le même texte que l'input
+                if (t !== s.lastText || true) {
+                  saveTranscription(orateurId, lang, t);
+                  broadcastSubtitle(room, lang, t);
+                  log(`🌐 TRADUCTION [${lang}]: "${t}"`);
+                }
+              }
+            }
+            if (c.turnComplete) s.lastText = '';
+            if (!isCaption && c.modelTurn?.parts && s.audioSource) {
+              let audioBytes = 0;
+              for (const p of c.modelTurn.parts) {
+                if (p.inlineData?.data) {
+                  const buf = Buffer.from(p.inlineData.data, 'base64');
+                  audioBytes += buf.length;
+                  const i16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength/2);
+                  const frame = new LiveKitAudioFrame(i16, GEMINI_OUTPUT_SAMPLE_RATE, 1, i16.length);
+                  s.audioQueue = s.audioQueue.then(() => s.audioSource.captureFrame(frame)).catch(e => log(`❌ Audio ${lang}: ${e.message}`));
+                }
+              }
+              if (audioBytes > 0) log(`🔊 Audio [${lang}] reçu: ${audioBytes} octets`);
+            }
+          } catch(e) {
+            log(`❌ Erreur traitement message [${lang}]: ${e.message}`);
           }
         },
-        onerror: (e) => { log(`❌ Gemini [${lang}] ERREUR: ${e?.message}`); if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
-        onclose: () => { log(`🔌 Gemini [${lang}] déconnecté, reconnexion...`); s.ready = false; if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
+        onerror: (e) => { log(`❌ Gemini [${lang}] ERREUR: ${e?.message || e}`); if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
+        onclose: (e) => { log(`🔌 Gemini [${lang}] déconnecté (${e?.reason || 'raison inconnue'}), reconnexion...`); s.ready = false; if (!s.closing) setTimeout(()=>reconnectLangSession(orateurId,lang),3000); },
       }
     });
     s.geminiSession = geminiSession;
@@ -180,7 +205,6 @@ function feedAudio(id, buffer, seq) {
   for (const [lang, s] of o.langSessions.entries()) {
     if (s.ready && s.geminiSession) {
       try {
-        // ✅ NOM DE CHAMP CORRIGÉ ICI AUSSI : media PAS audio
         s.geminiSession.sendRealtimeInput({ media: { data: buffer.toString('base64'), mimeType: 'audio/pcm;rate=16000' } });
       } catch(e) {
         log(`❌ Envoi chunk [${lang}]: ${e.message}`);
@@ -202,7 +226,7 @@ async function publishLangAudioTrack(id, lang, s) {
 
 async function pumpAudioTrack(id, track) {
   const rtc = await ensureLiveKitRtc();
-  log(`🎧 Pompe audio démarrée...`);
+  log(`🎧 Pompe audio démarrée (16kHz mono PCM16, chunks 100ms)...`);
   const stream = new rtc.AudioStream(track, { sampleRate: SAMPLE_RATE, numChannels: 1 });
   let leftover = Buffer.alloc(0), seq = 0, totalBytes = 0, lastLog = Date.now();
   try {
@@ -230,12 +254,12 @@ async function scanForMic(orateurId, room) {
   log(`🔍 Scan: ${parts.length} participants`);
   for (const p of parts) {
     const pubs = p.publications ? Array.from(p.publications.values()) : [];
-    log(`   👤 ${p.identity}: ${pubs.length} pistes`);
+    log(`   👤 Participant : ${p.identity}`);
+    log(`      → ${pubs.length} piste(s) publiée(s)`);
     for (const pub of pubs) {
       const isAudio = pub.kind === rtc.TrackKind.KIND_AUDIO;
-      log(`      → "${pub.name}" (${isAudio ? 'AUDIO' : 'autre'})`);
+      log(`      → Piste : "${pub.name}" (${isAudio ? 'AUDIO' : 'autre'})`);
       if (isAudio && pub.name === 'orator-mic') {
-        log(`✅ MICRO TROUVÉ chez ${p.identity}`);
         try {
           let track = pub.track;
           if (!track) track = await pub.setSubscribed(true);
@@ -299,7 +323,7 @@ function stopBotForRoom(id) {
 }
 
 // ROUTES
-app.get('/health', (req, res) => res.json({ ok: true, version: '1.0.8' }));
+app.get('/health', (req, res) => res.json({ ok: true, version: BOT_VERSION }));
 app.get('/livekit-token', async (req, res) => {
   const { room, identity, role } = req.query;
   if (!room || !identity) return res.status(400).json({ error: 'room/identity requis' });
